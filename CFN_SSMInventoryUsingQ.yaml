@@ -1,0 +1,1710 @@
+---
+# SSM Patch Dashboard
+#
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template to dynamic build a QuickSight dashboard where you can visualize Systems Manager patching/inventory information
+
+Metadata:
+  AWS::CloudFormation::Interface:
+
+    ParameterGroups:
+      - Label:
+          default: SSM Resource Data Sync and Custom inventory configuration
+        Parameters:
+          - ResourceSyncS3Bucket
+          - TargetType
+          - TagKey
+          - TagValue
+      - Label:
+          default: 'AWS Accounts Options'
+        Parameters:
+          - OrganizationID
+          - AccountIDs
+          - Regions
+      - Label:
+          default: Amazon Athena
+        Parameters:
+          - AthenaDatabaseName
+      - Label:
+          default: Amazon QuickSight
+        Parameters:
+          - QuickSightUser
+
+    ParameterLabels:
+      ResourceSyncS3Bucket:
+        default: Amazon S3 Bucket for AWS Systems Manager resource data sync (Amazon S3 bucket are created in the same Region where you create the CloudFormation stack)
+      OrganizationID:
+        default: AWS Organization ID (leave empty if AWS Organization is not setup)
+      AccountIDs:
+        default: AWS Account IDs
+      Regions:
+        default: AWS Account Regions
+      AthenaDatabaseName:
+        default: Amazon Athena Database Name
+      QuickSightUser:
+        default: Amazon QuickSight user
+      TargetType:
+        default: Target type for custom inventory association (ALL for all instances, TAG for tag-based targeting)
+      TagKey:
+        default: Tag key for targeting instances for custom inventory association (required if TargetType is TAG)
+      TagValue:
+        default: Tag value for targeting instances for custom inventory association (required if TargetType is TAG)
+
+Parameters:
+  ResourceSyncS3Bucket:
+    Description: (Required) Name of the Amazon S3 bucket used for AWS Systems Manager resource data sync
+    Type: String
+    AllowedPattern: '(?!(^xn--|.+-s3alias$))^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$'
+    ConstraintDescription: 'Bucket name can be no longer than 63 characters and must be unique (S3 bucket name are global)'
+  OrganizationID:
+    Description: (Conditional) AWS Organization root ID (r-xxx) or Organization Unit ID (ou-xxx) for specific OU
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^(ou-[a-z0-9]{4,32}-[a-z0-9]{8,32}|r-[a-z0-9]{4,32})$'
+    ConstraintDescription: 'Must be empty, Organization root ID (r-xxxx), or Organization Unit ID (ou-xxxx)'
+  AccountIDs:
+    Description: (Required if OrganizationID is empty) List (use comma to separate accounts) of AWS Accounts. Leave empty to deploy to all accounts in the Organization or the OU as specified in "OrganizationID" parameter.
+    Type: CommaDelimitedList
+    AllowedPattern: '^$|^[0-9]{12}$'
+    ConstraintDescription: 'Must be empty or comma-separated 12-digit AWS Account IDs (e.g., 123456789012,987654321098)'
+  Regions:
+    Description: (Required) List (use comma to separate regions) of AWS Regions (e.g., us-east-1,us-west-2)
+    Type: CommaDelimitedList
+    Default: us-east-1
+    AllowedPattern: '^[a-zA-Z0-9-]{1,128}$'
+    ConstraintDescription: 'Must be comma-separated AWS region names (e.g., us-east-1,us-west-2)'
+  AthenaDatabaseName:
+    Description: (Required) Amazon Athena Database name for AWS Systems Manager resource data sync
+    Type: String
+    Default: ssm_datasync_resources
+  QuickSightUser:
+    Description: (Required) Amazon QuickSight User
+    Type: String
+    AllowedPattern: '.+'
+    ConstraintDescription: 'Amazon QuickSight user is required'
+  TargetType:
+    Type: String
+    Default: 'ALL'
+    AllowedValues:
+      - 'ALL'
+      - 'TAG'
+    Description: '(Required) Target type for custom inventory association (ALL for all instances, TAG for tag-based targeting)'
+  TagKey:
+    Type: String
+    Description: '(Required if TargetType is TAG) Tag key for targeting instances for custom inventory association'
+  TagValue:
+    Type: String
+    Description: '(Required if TargetType is TAG) Tag value for targeting instances for custom inventory association'
+
+Conditions:
+  UseOrganization: !Not [!Equals [!Ref OrganizationID, '']]
+  UseTagTargeting: !Equals [!Ref TargetType, 'TAG']
+  UseAccountIDs: !Not [!Equals [!Join [',', !Ref AccountIDs], '']]
+
+Resources:
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "Access logging it not required for this bucket as access is allowed only by the AWS services. The bucket stores only metadata and there is no critical data stored"
+          - id: W41
+            reason: "S3 bucket is enabled SSE-S3 encryption by default"
+    Properties:
+      BucketName: !Ref ResourceSyncS3Bucket
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Sid: DenyInsecureConnections
+          Effect: Deny
+          Principal: "*"
+          Action: "s3:*"
+          Resource: !Join [ '', [ !GetAtt S3Bucket.Arn, '/*' ] ]
+          Condition:
+            Bool:
+              "aws:SecureTransport": "false"
+        - Sid: SSMBucketPermissionsCheck
+          Effect: Allow
+          Principal:
+            Service: ssm.amazonaws.com
+          Action: 
+            - s3:GetBucketAcl
+            - s3:ListBucket
+            - s3:GetBucketLocation
+          Resource: !GetAtt S3Bucket.Arn
+        - Sid: QuickSightGlueAthenaAccess
+          Effect: Allow
+          Principal:
+            Service:
+              - glue.amazonaws.com
+              - quicksight.amazonaws.com
+              - athena.amazonaws.com
+          Action:
+            - s3:Get*
+            - s3:List*
+          Resource: !GetAtt S3Bucket.Arn
+        - Sid: SSMBucketDelivery
+          Effect: Allow
+          Principal:
+            Service: ssm.amazonaws.com
+          Action: s3:PutObject
+          Resource: !Join [ '', [ !GetAtt S3Bucket.Arn, '/*' ] ]
+          Condition:
+            StringEquals:
+              s3:x-amz-acl: bucket-owner-full-control
+        - Sid: SSMBucketDeliveryTagging
+          Effect: Allow
+          Principal:
+            Service: ssm.amazonaws.com
+          Action: s3:PutObjectTagging
+          Resource: !Join [ '', [ !GetAtt S3Bucket.Arn, '/*' ] ]
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref AthenaDatabaseName
+        Description: Systems Manager Glue Database
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      DatabaseName: !Ref GlueDatabase
+      Description: Crawler for AWS Systems Manager Resource Data Sync
+      Name: !Join [ '', [ 'SSM-GlueCrawler-', !Ref 'AWS::StackName' ] ]
+      Role: !GetAtt GlueCrawlerRole.Arn
+      Schedule:
+        ScheduleExpression: 'cron(0 */12 ? * * *)'
+      Targets:
+        S3Targets:
+          - Path: !Ref ResourceSyncS3Bucket
+            Exclusions:
+              - AWS:InstanceInformation/accountid=*/test.json
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - glue.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole
+      Path: '/service-role/'
+      Description: Role created for Glue to access resource data sync S3 bucket
+      Policies:
+        - PolicyName: S3Actions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Join [ '', [ !GetAtt S3Bucket.Arn, '/*' ] ]
+  RunCrawlerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "The logs are the Glue crawler execution details and are not sensitive information, encryption is not required"
+    Properties:
+      LogGroupName: !Join [ '', [ '/aws/lambda/SSM-RunCrawlerFunction-', !Ref 'AWS::StackName' ] ]
+      RetentionInDays: 30
+  RunCrawlerLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "QuickSight ListNamespaces API only supports * on the resource as this is describe/list API and does not perform any mutable operation"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlueCrawlerActions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                  - glue:UpdateCrawler
+                Resource: !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:crawler/${GlueCrawler}
+        - PolicyName: GlueActions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/aws_instanceinformation
+        - PolicyName: DeleteGlueTableLambdaLogsPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                Resource: !Join [ '', [ !GetAtt RunCrawlerLambdaLogGroup.Arn, ':*' ] ]
+        - PolicyName: QuickSightNamespaces
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - quicksight:ListNamespaces
+                Resource: "*"
+  RunCrawlerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "VPC is not required for this Lambda function execution. This function runs only once to update the Glue Crawler configuration"
+    Properties:
+      FunctionName: !Sub SSM-Inventory-RunCrawlerOnce-${AWS::StackName}
+      Description: Handles Glue crawler operations and table column cleanup
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt RunCrawlerLambdaRole.Arn
+      Timeout: 600
+      MemorySize: 256
+      ReservedConcurrentExecutions: 5
+      LoggingConfig: 
+        LogGroup: !Ref RunCrawlerLambdaLogGroup
+      Environment:
+        Variables:
+          CRAWLER_NAME: !Ref GlueCrawler
+          DATABASE_NAME: !Ref GlueDatabase
+      Code:
+        ZipFile: |
+          #*
+          #* Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          #* SPDX-License-Identifier: MIT-0
+          #*
+          #* Permission is hereby granted, free of charge, to any person obtaining a copy of this
+          #* software and associated documentation files (the "Software"), to deal in the Software
+          #* without restriction, including without limitation the rights to use, copy, modify,
+          #* merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+          #* permit persons to whom the Software is furnished to do so.
+          #*
+          #* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+          #* INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+          #* PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+          #* HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+          #* OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+          #* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+          #*
+
+          import boto3
+          import cfnresponse
+          import time
+          import os
+
+          CRAWLER_NAME = os.environ['CRAWLER_NAME']
+          DATABASE_NAME = os.environ['DATABASE_NAME']
+          TABLE_NAME = 'aws_instanceinformation'
+          COLUMN_NAME = 'resourcetype'
+
+          glue = boto3.client('glue')
+
+          def get_quicksight_region(account_id, current_region):
+              """Detect QuickSight region using namespace capacity region"""
+              try:
+                  client = boto3.client('quicksight')
+                  quicksight_namespaces = client.list_namespaces(
+                      AwsAccountId=account_id,
+                      MaxResults=50
+                  )
+                  for namespace in quicksight_namespaces['Namespaces']:
+                      if namespace['Name'] == 'default':
+                          return namespace['CapacityRegion']
+                  return current_region
+              except Exception as e:
+                  print(f"Error detecting QuickSight region: {str(e)}")
+                  return current_region
+
+          def lambda_handler(event, context):
+              responseData = {}
+              responseStatus = 'SUCCESS'
+              try:
+                if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                  account_id = event['ResourceProperties']['AccountId']
+                  current_region = event['ResourceProperties']['Region']
+                  
+                  # Detect QuickSight region
+                  responseData['QuickSightRegion'] = get_quicksight_region(account_id, current_region)
+
+                  glue.start_crawler(Name=CRAWLER_NAME)
+                  
+                  # Wait for crawler to complete (with timeout)
+                  max_wait_time = 300  # 5 minutes max wait
+                  wait_interval = 10   # Check every 10 seconds
+                  elapsed_time = 0
+
+                  while elapsed_time < max_wait_time:
+                    crawler_status = glue.get_crawler(Name=CRAWLER_NAME)['Crawler']['State']
+                    if crawler_status == 'READY': 
+                        responseData['Status'] = 'Crawler completed successfully'
+                        break
+                    elif crawler_status == 'FAILED':
+                        responseData['Status'] = 'Crawler failed'
+                        responseStatus = 'FAILED'
+                        break
+
+                    time.sleep(wait_interval)
+                    elapsed_time += wait_interval
+
+                  if elapsed_time >= max_wait_time:
+                    responseData['Status'] = 'Crawler still running, timeout reached'
+
+                  if responseStatus == 'SUCCESS':
+                    try:
+                      response = glue.get_table(
+                        CatalogId=account_id,
+                        DatabaseName=DATABASE_NAME,
+                        Name=TABLE_NAME
+                      )
+                      # Update the column name if the table exists.
+                      if response['Table']:
+                          table = response['Table']
+                          # We have a reference to the table, so get the columns.
+                          columns = table['StorageDescriptor']['Columns']
+                          # Remove the unwanted column.
+                          updated_columns = [i for i in columns if not (i['Name'] == COLUMN_NAME)]
+                          # Update the columns for the table object.
+                          table['StorageDescriptor']['Columns'] = updated_columns
+                          # Remove unnecessary fields.
+                          table.pop('DatabaseName', None)
+                          table.pop('CreatedBy', None)
+                          table.pop('CreateTime', None)
+                          table.pop('UpdateTime', None)
+                          table.pop('IsRegisteredWithLakeFormation', None)
+                          table.pop('CatalogId', None)
+                          table.pop('VersionId', None)
+                          table.pop('IsMultiDialectView', None)
+                          # Update the table with the removed 'resourcetype' column.
+                          response = glue.update_table(
+                              CatalogId=account_id,
+                              DatabaseName=DATABASE_NAME,
+                              TableInput=table
+                          )
+                          responseData['TableUpdate'] = 'Column removed successfully'
+                    except Exception as e:
+                      responseStatus = 'FAILED'
+                      responseData['TableUpdate'] = str(e)
+
+                    # Update crawler configuration to ignore schema changes
+                    try:
+                      glue.update_crawler(
+                        Name=CRAWLER_NAME,
+                        SchemaChangePolicy={
+                          'UpdateBehavior': 'LOG'
+                        }
+                      )
+                      responseData['CrawlerUpdate'] = 'Schema change policy updated'
+                    
+                    except Exception as e:
+                      responseData['CrawlerUpdateError'] = str(e)
+
+                elif event['RequestType'] == 'Delete':
+                  responseData['Status'] = 'Crawler will be deleted by CloudFormation'
+
+              except Exception as e:
+                  responseStatus = 'FAILED'
+                  responseData['Error'] = str(e)
+              cfnresponse.send(event, context, responseStatus, responseData)
+  InvokeCrawlerLambda:
+    Type: Custom::Function
+    DependsOn: StackSet
+    Properties:
+      ServiceToken: !GetAtt RunCrawlerLambdaFunction.Arn
+      ServiceTimeout: 600
+      AccountId: !Ref AWS::AccountId
+      Region: !Ref AWS::Region
+  StackSet:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      Description: 'SSM Data Sync'
+      PermissionModel: !If [UseOrganization, SERVICE_MANAGED, SELF_MANAGED]
+      Capabilities:
+        - CAPABILITY_IAM
+      Parameters:
+        - ParameterKey: ResourceSyncS3Bucket
+          ParameterValue: !Ref S3Bucket
+        - ParameterKey: ResourceSyncS3BucketRegion
+          ParameterValue: !Ref AWS::Region
+        - ParameterKey: TargetType
+          ParameterValue: !Ref TargetType
+        - ParameterKey: TagKey
+          ParameterValue: !Ref TagKey
+        - ParameterKey: TagValue
+          ParameterValue: !Ref TagValue
+      AutoDeployment: !If
+        - UseOrganization
+        - Enabled: true
+          RetainStacksOnAccountRemoval: false
+        - !Ref AWS::NoValue
+      StackInstancesGroup:
+        - DeploymentTargets: !If 
+          - UseOrganization
+          - OrganizationalUnitIds: [!Ref OrganizationID]
+            Accounts: !If 
+              - UseAccountIDs
+              - !Ref AccountIDs 
+              - !Ref AWS::NoValue
+            AccountFilterType: !If 
+              - UseAccountIDs 
+              - INTERSECTION
+              - !Ref AWS::NoValue
+          - Accounts: !Ref AccountIDs
+          Regions: !Ref Regions
+      StackSetName: !Join [ '', [ !Ref 'AWS::StackName', '-SSMResourceSync' ] ]
+      TemplateBody: |
+        AWSTemplateFormatVersion: '2010-09-09'
+        Description: 'SSM Resorce data Sync and Custom inventory Association'
+
+        Parameters:
+          ResourceSyncS3Bucket:
+            Type: String
+            Description: 'Amazon S3 bucket for AWS Systems Manager resource data sync for inventory'
+
+          ResourceSyncS3BucketRegion:
+            Type: String
+            Description: 'Amazon S3 bucket region for AWS Systems Manager resource data sync for inventory'
+
+          TargetType:
+            Type: String
+            Default: 'ALL'
+            AllowedValues:
+              - 'ALL'
+              - 'TAG'
+            Description: 'Target type for SSM association (ALL for all instances, TAG for tag-based targeting)'
+
+          TagKey:
+            Type: String
+            Default: ''
+            Description: 'Tag key for targeting instances (required if TargetType is TAG)'
+
+          TagValue:
+            Type: String
+            Default: ''
+            Description: 'Tag value for targeting instances (required if TargetType is TAG)'
+
+        Conditions:
+          UseTagTargeting: !Equals [!Ref TargetType, 'TAG']
+
+        Resources:
+          CloudProviderSSMDocument:
+            Type: AWS::SSM::Document
+            Properties:
+              DocumentType: Command
+              Content:
+                schemaVersion: '2.2'
+                description: 'Run Command document to execute Get-cloud-provider.ps1 script'
+                parameters: {}
+                mainSteps:
+                  - action: 'aws:runPowerShellScript'
+                    name: 'RunCloudProviderScript'
+                    precondition:
+                      StringEquals:
+                      - platformType
+                      - Windows
+                    inputs:
+                      runCommand:
+                        - |
+                          # function to detect the cloud provider or on-premise VM
+                          function Get-CloudProvider {
+                             Write-Host "Starting cloud provider detection..."
+                             # detect from registry
+                             function Get-CloudProviderFromRegistry {
+                                 $cloudProviders = @{
+                                     "AWS" = "HKLM:\SOFTWARE\Amazon";
+                                     "Azure" = "HKLM:\SOFTWARE\Microsoft\Windows Azure";
+                                     "Google Cloud" = "HKLM:\SOFTWARE\Google\ComputeEngine";
+                                     "Oracle Cloud" = "HKLM:\SOFTWARE\ORACLE\Cloud";
+                                 }
+                     
+                                foreach ($provider in $cloudProviders.Keys) {
+                                    Write-Host "Checking for $provider registry: $($cloudProviders[$provider])"
+                                    try {
+                                        if (Test-Path $cloudProviders[$provider]) {
+                                        Write-Host "$provider detected via registry"
+                                        return $provider
+                                        }
+                                    }
+                                    catch {
+                                        return $false
+                                    }  
+                                }
+                                return $false
+                            }
+                     
+                            # detect from metadata
+                            function Get-CloudProviderMetadata {
+
+                                function Test-AWSMetadata {
+                                    try {
+                                        $url = "http://169.254.169.254/latest/meta-data/"
+                                        [string]$token = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token-ttl-seconds" = "21600"} -Method PUT -Uri http://169.254.169.254/latest/api/token
+                                        $response = Invoke-WebRequest -Headers @{"X-aws-ec2-metadata-token" = $token} -Method GET -Uri $url -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+                                        if ($response.StatusCode -eq 200) {
+                                            Write-Host "AWS detected via metadata API."
+                                            return $true
+                                        }
+                                    }
+                                    catch {
+                                        return $false
+                                    }
+                                    return $false
+                                }
+                         
+                                function Test-AzureMetadata {
+                                    try {
+                                        $url = "http://169.254.169.254/metadata/instance?api-version=2021-01-01"
+                                        $response = Invoke-WebRequest -Uri $url -Method Get -Headers @{"Metadata"="true"} -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+                                        if ($response.StatusCode -eq 200) {
+                                            Write-Host "Azure detected via metadata API."
+                                            return $true
+                                        }
+                                    }
+                                    catch {
+                                        return $false
+                                    }
+                                    return $false
+                                }
+                         
+                                function Test-GCPMetadata {
+                                    try {
+                                        $url = "http://metadata.google.internal/computeMetadata/v1/"
+                                        $response = Invoke-WebRequest -Uri $url -Method Get -Headers @{"Metadata-Flavor"="Google"} -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+                                        if ($response.StatusCode -eq 200) {
+                                            Write-Host "Google Cloud detected via metadata API."
+                                            return $true
+                                        }
+                                    }
+                                    catch {
+                                        return $false
+                                    }
+                                    return $false
+                                }
+                         
+                                function Test-OCIMetadata {
+                                    try {
+                                        $url = "http://169.254.169.254/opc/v1/instance/"
+                                        $response = Invoke-WebRequest -Uri $url -Method Get -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+                                        if ($response.StatusCode -eq 200) {
+                                            Write-Host "Oracle Cloud detected via metadata API."
+                                            return $true
+                                        }
+                                    }
+                                    catch {
+                                        return $false
+                                    }
+                                    return $false
+                                }
+
+                                try {
+                                    if (Test-AWSMetadata) { return "AWS" }
+                                    if (Test-AzureMetadata) { return "Azure" }
+                                    if (Test-GCPMetadata) { return "Google Cloud" }
+                                    if (Test-OCIMetadata) { return "Oracle Cloud" }
+
+                                    Write-Host "No cloud provider metadata service detected."
+                                }
+                                catch {
+                                    Write-Host "Error occurred while querying metadata services: $_"
+                                    return $false
+                                }
+                                return $false
+                            }
+
+                            # Detecting On-Premise VMs
+                            function Get-OnPremVM {
+                                try {
+                                    Write-Host "Checking if running on a virtualized on-premise environment..."
+                                    $vmCheck = Get-WmiObject -Class Win32_ComputerSystem | Select-Object Manufacturer, Model
+                                    Write-Host "Manufacturer: $($vmCheck.Manufacturer), Model: $($vmCheck.Model)"
+                                    $vmManufacturers = @(
+                                        "VMware, Inc.",
+                                        "VMware",
+                                        "Xen",
+                                        "QEMU",
+                                        "VirtualBox",
+                                        "Parallels"
+                                    )
+                                    if ($vmManufacturers -contains $vmCheck.Manufacturer) {
+                                        Write-Host "On-Premise VM detected."
+                                        return $vmCheck.Manufacturer
+                                    }
+                                }
+                                catch {
+                                    Write-Host "Error occurred while quering on-prem details: $_"
+                                    return $false
+                                }
+                                return $false
+                            }
+
+                            # Get the provider
+                            $result = Get-CloudProviderFromRegistry
+                            if ($result) { return $result }
+                     
+                            $result = Get-CloudProviderMetadata
+                            if ($result) { return $result }
+
+                            $result = Get-OnPremVM
+                            if ($result) { return $result }
+
+                            # if no provider detected
+                            Write-Host "No provider detected. Returning Unknown."
+                            return "Unknown"
+                          }
+
+                          # Function to check disk space and return status
+                          function Get-DiskSpaceStatus {
+                             Write-Host "Checking disk space for C drive..."
+                     
+                            try {
+                                $disk = Get-WmiObject -Class Win32_LogicalDisk -Filter "DeviceID='C:'"
+                                if ($disk) {
+                                    $freeSpacePercent = ($disk.FreeSpace / $disk.Size) * 100
+                                    $freeSpacePercent = [math]::Round($freeSpacePercent, 2)
+                             
+                                     Write-Host "Free space percentage: $freeSpacePercent%"
+                             
+                                    if ($freeSpacePercent -le 10) {
+                                        return @{
+                                            Status = "Critical"
+                                            FreeSpacePercent = $freeSpacePercent
+                                            TotalGB = [math]::Round($disk.Size / 1GB, 2)
+                                            FreeGB = [math]::Round($disk.FreeSpace / 1GB, 2)
+                                        }
+                                    } else {
+                                        return @{
+                                            Status = "Normal"
+                                            FreeSpacePercent = $freeSpacePercent
+                                            TotalGB = [math]::Round($disk.Size / 1GB, 2)
+                                            FreeGB = [math]::Round($disk.FreeSpace / 1GB, 2)
+                                        }
+                                    }
+                                }
+                            } catch {
+                                Write-Host "Error occurred while checking disk space: $_"
+                                return @{
+                                    Status = "Error"
+                                    FreeSpacePercent = 0
+                                    TotalGB = 0
+                                    FreeGB = 0
+                                }
+                            }
+                          }
+
+                          #Function to get the nodeid
+                          function Get-SSMManagedInstanceID {
+                             # First try EC2 metadata
+                             try {
+                                 [string]$token = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token-ttl-seconds" = "21600"} -Method PUT -Uri http://169.254.169.254/latest/api/token
+                                 $metadataResponse = Invoke-WebRequest -Headers @{"X-aws-ec2-metadata-token" = $token} -Method GET -Uri "http://169.254.169.254/latest/meta-data/instance-id" -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+                                 if ($metadataResponse.StatusCode -eq 200) {
+                                     Write-host "EC2 instance detected, using instance-id from metadata"
+                                     return $metadataResponse.Content
+                                 }
+                             }
+                             catch {
+                                 Write-host "Not an EC2 instance, checking for hybrid instance registration"
+                             }
+
+                            # If not EC2, check for hybrid instance registration
+                            $infoPath = "$env:SystemDrive\ProgramData\Amazon\SSM\InstanceData"
+                            $infoFile = Join-Path $infoPath "registration"
+                     
+                            if (Test-Path $infoFile) {
+                                try {
+                                    $instanceInfo = Get-Content $infoFile | ConvertFrom-Json
+                                    Write-host "Hybrid instance detected, using managed instance ID from registration"
+                                    return $instanceInfo.ManagedInstanceID
+                                }
+                                catch {
+                                    Write-host "Error reading SSM instance info file: $_"
+                                    return $null
+                                }
+                            }
+                            else {
+                                Write-host "No instance ID found - neither EC2 nor hybrid instance"
+                                return $null
+                            }
+                          }
+
+                          #Function to get the ENA and NVMe driver for EC2 AWS
+                          function Get-DriverVersions {
+                             try {
+                                 [string]$token = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token-ttl-seconds" = "21600"} -Method PUT -Uri http://169.254.169.254/latest/api/token
+                                 $EC2Type = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token" = $token} -Method GET -Uri http://169.254.169.254/latest/meta-data/system -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue    
+                                 Write-Host "Gathering the driver details..."
+                                 $enaDriverVersion = (Get-WmiObject -Class Win32_PnPSignedDriver | Where-Object {$_.DeviceName -like "*Elastic Network Adapter*"}).DriverVersion
+                                 $nvmeDriverVersion = (Get-WmiObject -Class Win32_PnPSignedDriver | Where-Object {$_.DeviceName -like "*AWS NVMe*"}).DriverVersion | Select-Object -First 1
+                                 Write-Host "Obtained the driver information"
+                                 return @{
+                                     EC2Type = $EC2Type
+                                     ENAVersion = $enaDriverVersion
+                                     NVMeVersion = $nvmeDriverVersion
+                                 }
+                             }
+                             catch {
+                                 Write-Host "Error occurred while querying driver versions: $_"
+                                 return @{
+                                     EC2Type = "Error"
+                                     ENAVersion = "Error"
+                                     NVMeVersion = "Error"
+                                 }
+                             }
+                          }
+
+                          # Determine BYOL Licensing from marketplace codes
+                          function Get-BYOLLicensing {
+                             $marketplaceCodes = @{
+                                 WindowsBYOL = "bp-67a5400e"
+                                 RedHatBYOLLinux = "bp-63a5400a"
+                                 WindowsLI = "bp-6ba54002"
+                                 # Add more marketplace codes as needed
+                             }
+                             try {
+                                 Write-Host "Gathering licensing information..."
+                                 [string]$token = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token-ttl-seconds" = "21600"} -Method PUT -Uri http://169.254.169.254/latest/api/token
+                                 $billingInfo = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token" = $token} -Method GET -Uri http://169.254.169.254/latest/dynamic/instance-identity/document -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+                                 $mpcode = $billingInfo.billingProducts
+
+                                # compare the billing products with the marketplace codes  
+                                $licenseType = $marketplaceCodes.GetEnumerator() | Where-Object { $_.Value -eq $mpcode[0] } | Select-Object -ExpandProperty Key
+                                if ($licenseType -eq "") {
+                                    return "MP License Not Found"
+                                }
+                                Write-Host "Obtained the licensing information"
+                                return $licenseType
+                            }
+                            catch {
+                                Write-Host "Error occurred while querying licensing: $_"
+                                return "Error"
+                            } 
+                          }
+
+                          # get the instance type on-demand vs reserved vs spot etc.
+                          function Get-InstanceType {
+                             try {
+                                 Write-Host "Gathering instance type..."
+                                 [string]$token = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token-ttl-seconds" = "21600"} -Method PUT -Uri http://169.254.169.254/latest/api/token
+                                 $instanceType = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token" = $token} -Method GET -Uri http://169.254.169.254/latest/meta-data/instance-life-cycle
+                                 Write-Host "Obtained the instance type"
+                                 return $instanceType
+                             }
+                             catch {
+                                 Write-Host "Error occurred while querying instance type: $_"
+                                 return "Error"
+                             }
+                     
+                          }
+
+                          # Call the functions
+                          $cloudProvider = Get-CloudProvider
+                          $diskSpace = Get-DiskSpaceStatus
+                          $nodeid = Get-SSMManagedInstanceID
+
+                          # Get additional details if cloud provider is AWS
+                          if ($cloudProvider -eq "AWS") {
+                             Write-Host "Cloud provider is AWS, gathering additional details"
+                             $driverVersions = Get-DriverVersions
+                             $licenseType = Get-BYOLLicensing
+                             $instanceType = Get-InstanceType
+                          }
+                          else {
+                             Write-Host "Cloud provider is not AWS, skipping additional details"
+                             $driverVersions = @{
+                                 EC2Type = "N/A"
+                                 ENAVersion = "N/A"
+                                 NVMeVersion = "N/A"
+                             }
+                             $licenseType = "N/A"
+                             $instanceType = "N/A"
+                          }
+
+                          # Create SSM Custom Inventory JSON File with added disk space information
+                          $inventoryData = @{
+                             SchemaVersion = "1.0"
+                             TypeName = "Custom:NodeInfo"
+                             Content = @{
+                                 CloudProvider = $cloudProvider
+                                 Hostname = $env:COMPUTERNAME
+                                 DiskSpaceStatus = "$($diskSpace.Status)"
+                                 FreeSpacePercent = "$($diskSpace.FreeSpacePercent)"
+                                 TotalGB = "$($diskSpace.TotalGB)"
+                                 FreeGB = "$($diskSpace.FreeGB)"
+                                 EC2Type = "$($driverVersions.EC2Type)"
+                                 ENAVersion = "$($driverVersions.ENAVersion)"
+                                 NVMeVersion = "$($driverVersions.NVMeVersion)"
+                                 LicenseType = $licenseType
+                                 InstanceType = $instanceType
+                             }
+                          } | ConvertTo-Json -Depth 4
+
+                          # Define Inventory Path Based on OS
+                          $inventoryFolder = "$env:SystemDrive\ProgramData\Amazon\SSM\InstanceData\$nodeid\inventory\custom"
+                          if (-not (Test-Path -Path $inventoryFolder)) {
+                              Write-Host "Creating Inventory folder: $inventoryFolder"
+                              New-Item -ItemType Directory -Path $inventoryFolder -Force | Out-Null
+                          }
+                          $ssmInventoryPath = Join-Path $inventoryFolder "Custom_NodeInfo.json"
+
+                          Write-Host "Saving SSM Inventory JSON to: $ssmInventoryPath"
+                          # Using UTF8NoBOM encoding to prevent invalid character issues
+                          [System.IO.File]::WriteAllText($ssmInventoryPath, $inventoryData)
+
+                          # Also output the results to the console for SSM Run Command output
+                          $inventoryData
+                  - action: 'aws:runShellScript'
+                    name: 'RunCloudProviderScriptLinux'
+                    precondition:
+                      StringEquals:
+                      - platformType
+                      - Linux
+                    inputs:
+                      runCommand:
+                        - |
+                          #!/bin/bash
+                          
+                          # Function to detect cloud provider (returns only the provider name)
+                          get_cloud_provider() {
+                              # Check system files first
+                              if [ -d "/opt/aws" ] || [ -f "/usr/bin/aws" ] || [ -f "/opt/amazon/ssm/amazon-ssm-agent" ]; then
+                                  echo "AWS"
+                                  return 0
+                              fi
+                              
+                              if [ -d "/opt/microsoft" ] || [ -f "/usr/sbin/waagent" ] || [ -f "/etc/waagent.conf" ]; then
+                                  echo "Azure"
+                                  return 0
+                              fi
+                              
+                              if [ -d "/opt/google" ] || [ -f "/usr/bin/gcloud" ] || [ -f "/etc/google_instance_id" ]; then
+                                  echo "Google Cloud"
+                                  return 0
+                              fi
+                              
+                              if [ -d "/opt/oracle" ] || [ -f "/usr/libexec/oci-growfs" ]; then
+                                  echo "Oracle Cloud"
+                                  return 0
+                              fi
+                              
+                              # Try metadata APIs
+                              local token=$(curl -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+                                           -s --connect-timeout 2 --max-time 2 \
+                                           "http://169.254.169.254/latest/api/token" 2>/dev/null)
+                              
+                              if [ -n "$token" ]; then
+                                  local response=$(curl -H "X-aws-ec2-metadata-token: $token" \
+                                                 -s --connect-timeout 2 --max-time 2 \
+                                                 "http://169.254.169.254/latest/meta-data/" 2>/dev/null)
+                                  if [ $? -eq 0 ] && [ -n "$response" ]; then
+                                      echo "AWS"
+                                      return 0
+                                  fi
+                              fi
+                              
+                              # Test Azure metadata
+                              local response=$(curl -H "Metadata: true" \
+                                             -s --connect-timeout 2 --max-time 2 \
+                                             "http://169.254.169.254/metadata/instance?api-version=2021-01-01" 2>/dev/null)
+                              if [ $? -eq 0 ] && [ -n "$response" ]; then
+                                  echo "Azure"
+                                  return 0
+                              fi
+                              
+                              # Test GCP metadata
+                              local response=$(curl -H "Metadata-Flavor: Google" \
+                                             -s --connect-timeout 2 --max-time 2 \
+                                             "http://metadata.google.internal/computeMetadata/v1/" 2>/dev/null)
+                              if [ $? -eq 0 ] && [ -n "$response" ]; then
+                                  echo "Google Cloud"
+                                  return 0
+                              fi
+                              
+                              # Test Oracle Cloud metadata
+                              local response=$(curl -s --connect-timeout 2 --max-time 2 \
+                                             "http://169.254.169.254/opc/v1/instance/" 2>/dev/null)
+                              if [ $? -eq 0 ] && [ -n "$response" ]; then
+                                  echo "Oracle Cloud"
+                                  return 0
+                              fi
+                              
+                              echo "On-Premise"
+                          }
+                          
+                          # Function to check disk space (returns status|percent|total|free)
+                          get_disk_space_status() {
+                              local df_output=$(df / | tail -1)
+                              local total_kb=$(echo "$df_output" | awk '{print $2}')
+                              local avail_kb=$(echo "$df_output" | awk '{print $4}')
+                              
+                              local total_gb=$((total_kb / 1024 / 1024))
+                              local free_gb=$((avail_kb / 1024 / 1024))
+                              local free_percent=$((avail_kb * 100 / total_kb))
+                              
+                              local status="Normal"
+                              if [ "$free_percent" -lt 10 ]; then
+                                  status="Critical"
+                              fi
+                              
+                              echo "$status|$free_percent|$total_gb|$free_gb"
+                          }
+                          
+                          # Function to get SSM managed instance ID
+                          get_ssm_managed_instance_id() {
+                              # Try EC2 metadata first
+                              local token=$(curl -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+                                           -s --connect-timeout 2 --max-time 2 \
+                                           "http://169.254.169.254/latest/api/token" 2>/dev/null)
+                              
+                              if [ -n "$token" ]; then
+                                  local instance_id=$(curl -H "X-aws-ec2-metadata-token: $token" \
+                                                    -s --connect-timeout 2 --max-time 2 \
+                                                    "http://169.254.169.254/latest/meta-data/instance-id" 2>/dev/null)
+                                  if [ $? -eq 0 ] && [ -n "$instance_id" ]; then
+                                      echo "$instance_id"
+                                      return 0
+                                  fi
+                              fi
+                              
+                              # Try hybrid managed instance ID
+                              local ssm_info_file="/var/lib/amazon/ssm/registration"
+                              if [ -f "$ssm_info_file" ]; then
+                                  local managed_id=$(grep -o 'mi-[a-f0-9]*' "$ssm_info_file" 2>/dev/null | head -1)
+                                  if [ -n "$managed_id" ]; then
+                                      echo "$managed_id"
+                                      return 0
+                                  fi
+                              fi
+                              
+                              echo "unknown"
+                          }
+                          
+                          # Function to get driver versions (returns ec2type|ena|nvme)
+                          get_driver_versions() {
+                              local cloud_provider=$(get_cloud_provider)
+                              if [ "$cloud_provider" != "AWS" ]; then
+                                  echo "N/A|N/A|N/A"
+                                  return 0
+                              fi
+                              
+                              # Get EC2 system type
+                              local token=$(curl -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+                                           -s --connect-timeout 2 --max-time 2 \
+                                           "http://169.254.169.254/latest/api/token" 2>/dev/null)
+                              
+                              local ec2_type="Error"
+                              if [ -n "$token" ]; then
+                                  ec2_type=$(curl -H "X-aws-ec2-metadata-token: $token" \
+                                            -s --connect-timeout 2 --max-time 2 \
+                                            "http://169.254.169.254/latest/meta-data/system" 2>/dev/null)
+                                  [ -z "$ec2_type" ] && ec2_type="Error"
+                              fi
+                              
+                              # Get ENA driver version
+                              local ena_version="N/A"
+                              if [ -d "/sys/module/ena" ]; then
+                                  ena_version=$(modinfo ena 2>/dev/null | grep "^version:" | awk '{print $2}' 2>/dev/null || echo "N/A")
+                              fi
+                              
+                              # Get NVMe driver version
+                              local nvme_version="N/A"
+                              if [ -d "/sys/module/nvme" ]; then
+                                  nvme_version=$(modinfo nvme 2>/dev/null | grep "^version:" | awk '{print $2}' 2>/dev/null || echo "N/A")
+                              fi
+                              
+                              echo "$ec2_type|$ena_version|$nvme_version"
+                          }
+                          
+                          # Function to get BYOL licensing
+                          get_byol_licensing() {
+                              local cloud_provider=$(get_cloud_provider)
+                              if [ "$cloud_provider" != "AWS" ]; then
+                                  echo "N/A"
+                                  return 0
+                              fi
+                              
+                              local token=$(curl -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+                                           -s --connect-timeout 2 --max-time 2 \
+                                           "http://169.254.169.254/latest/api/token" 2>/dev/null)
+                              
+                              if [ -n "$token" ]; then
+                                  local billing_info=$(curl -H "X-aws-ec2-metadata-token: $token" \
+                                                     -s --connect-timeout 2 --max-time 2 \
+                                                     "http://169.254.169.254/latest/dynamic/instance-identity/document" 2>/dev/null)
+                                  
+                                  if [ $? -eq 0 ] && [ -n "$billing_info" ]; then
+                                      local mp_code=$(echo "$billing_info" | grep -o '"billingProducts":\s*\[\s*"[^"]*"' | sed 's/.*"\([^"]*\)".*/\1/' 2>/dev/null)
+                                      
+                                      case "$mp_code" in
+                                          "bp-67a5400e") echo "WindowsBYOL" ;;
+                                          "bp-63a5400a") echo "RedHatBYOLLinux" ;;
+                                          "bp-6ba54002") echo "WindowsLI" ;;
+                                          *) echo "MP License Not Found" ;;
+                                      esac
+                                      return 0
+                                  fi
+                              fi
+                              
+                              echo "Error"
+                          }
+                          
+                          # Function to get instance type
+                          get_instance_type() {
+                              local cloud_provider=$(get_cloud_provider)
+                              if [ "$cloud_provider" != "AWS" ]; then
+                                  echo "N/A"
+                                  return 0
+                              fi
+                              
+                              local token=$(curl -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+                                           -s --connect-timeout 2 --max-time 2 \
+                                           "http://169.254.169.254/latest/api/token" 2>/dev/null)
+                              
+                              if [ -n "$token" ]; then
+                                  local instance_type=$(curl -H "X-aws-ec2-metadata-token: $token" \
+                                                      -s --connect-timeout 2 --max-time 2 \
+                                                      "http://169.254.169.254/latest/meta-data/instance-life-cycle" 2>/dev/null)
+                                  
+                                  if [ $? -eq 0 ] && [ -n "$instance_type" ]; then
+                                      echo "$instance_type"
+                                      return 0
+                                  fi
+                              fi
+                              
+                              echo "Error"
+                          }
+                          
+                          # Main execution
+                          echo "Starting cloud provider detection..."
+                          cloud_provider=$(get_cloud_provider)
+                          echo "AWS detected via system files"
+                          
+                          echo "Checking disk space..."
+                          disk_info=$(get_disk_space_status)
+                          echo "Disk space check completed"
+                          
+                          echo "Getting SSM managed instance ID..."
+                          node_id=$(get_ssm_managed_instance_id)
+                          echo "EC2 instance detected, using instance ID"
+                          
+                          # Parse disk info
+                          IFS='|' read -r disk_status free_percent total_gb free_gb <<< "$disk_info"
+                          
+                          # Get additional details if cloud provider is AWS
+                          driver_info="N/A|N/A|N/A"
+                          license_type="N/A"
+                          instance_type="N/A"
+                          
+                          if [ "$cloud_provider" = "AWS" ]; then
+                              echo "Cloud provider is AWS, gathering additional details"
+                              echo "Gathering driver details..."
+                              driver_info=$(get_driver_versions)
+                              echo "Obtained driver information"
+                              
+                              echo "Gathering licensing information..."
+                              license_type=$(get_byol_licensing)
+                              echo "Obtained licensing information"
+                              
+                              echo "Gathering instance type..."
+                              instance_type=$(get_instance_type)
+                              echo "Obtained instance type"
+                          else
+                              echo "Cloud provider is not AWS, skipping additional details"
+                          fi
+                          
+                          # Parse driver info
+                          IFS='|' read -r ec2_type ena_version nvme_version <<< "$driver_info"
+                          
+                          # Create SSM Custom Inventory JSON
+                          hostname=$(hostname)
+                          inventory_data=$(cat <<EOF
+                          {
+                            "SchemaVersion": "1.0",
+                            "TypeName": "Custom:NodeInfo",
+                            "Content": {
+                              "CloudProvider": "$cloud_provider",
+                              "Hostname": "$hostname",
+                              "DiskSpaceStatus": "$disk_status",
+                              "FreeSpacePercent": "$free_percent",
+                              "TotalGB": "$total_gb",
+                              "FreeGB": "$free_gb",
+                              "EC2Type": "$ec2_type",
+                              "ENAVersion": "$ena_version",
+                              "NVMeVersion": "$nvme_version",
+                              "LicenseType": "$license_type",
+                              "InstanceType": "$instance_type"
+                            }
+                          }
+                          EOF
+                          )
+                          
+                          # Define inventory path
+                          inventory_folder="/var/lib/amazon/ssm/$node_id/inventory/custom"
+                          echo "Creating inventory folder: $inventory_folder"
+                          mkdir -p "$inventory_folder"
+                          
+                          ssm_inventory_path="$inventory_folder/Custom_NodeInfo.json"
+                          
+                          echo "Saving SSM Inventory JSON to: $ssm_inventory_path"
+                          echo "$inventory_data" > "$ssm_inventory_path"
+                          
+                          # Output results to console
+                          echo "$inventory_data"
+          
+          CloudProviderSSMAssociation:
+            Type: AWS::SSM::Association
+            Properties:
+              Name: !Ref CloudProviderSSMDocument
+              DocumentVersion: "$DEFAULT"
+              Targets: !If
+                - UseTagTargeting
+                - - Key: !Sub "tag:${TagKey}"
+                    Values:
+                      - !Ref TagValue
+                - - Key: "InstanceIds"
+                    Values:
+                      - "*"
+              ScheduleExpression: 'rate(7 days)'
+
+          ResourceDataSync:
+            Type: AWS::SSM::ResourceDataSync
+            Properties:
+              SyncName: patch-compliance-sync
+              SyncType: SyncToDestination
+              S3Destination:
+                BucketName: !Ref ResourceSyncS3Bucket
+                BucketRegion: !Ref ResourceSyncS3BucketRegion
+                SyncFormat: JsonSerDe
+        
+        Outputs:
+          SSMDocumentName:
+            Description: 'Name of the created SSM Document'
+            Value: !Ref CloudProviderSSMDocument
+
+          SSMAssociationId:
+            Description: 'ID of the created SSM Association'
+            Value: !Ref CloudProviderSSMAssociation
+  SSMDataSyncSource:
+    Type: AWS::QuickSight::DataSource
+    DependsOn: InvokeCrawlerLambda
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: SSMDataSync
+      Name: SSM Resource Data Sync Data Source
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: primary
+      Permissions:
+        - Principal: !Sub 
+            - arn:${AWS::Partition}:quicksight:${QuickSightRegion}:${AWS::AccountId}:user/default/${QuickSightUser}
+            - QuickSightRegion: !GetAtt InvokeCrawlerLambda.QuickSightRegion
+          Actions:
+          - quicksight:UpdateDataSourcePermissions
+          - quicksight:DescribeDataSourcePermissions
+          - quicksight:PassDataSource
+          - quicksight:DescribeDataSource
+          - quicksight:DeleteDataSource
+          - quicksight:UpdateDataSource
+  SSMInventoryDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: InvokeCrawlerLambda
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: ssm-inventory
+      Name: ssm-inventory
+      ImportMode: DIRECT_QUERY
+      Permissions:
+        - Principal: !Sub 
+            - arn:${AWS::Partition}:quicksight:${QuickSightRegion}:${AWS::AccountId}:user/default/${QuickSightUser}
+            - QuickSightRegion: !GetAtt InvokeCrawlerLambda.QuickSightRegion
+          Actions:
+          - quicksight:PassDataSet
+          - quicksight:DescribeIngestion
+          - quicksight:CreateIngestion
+          - quicksight:UpdateDataSet
+          - quicksight:DeleteDataSet
+          - quicksight:DescribeDataSet
+          - quicksight:CancelIngestion
+          - quicksight:DescribeDataSetPermissions
+          - quicksight:ListIngestions
+          - quicksight:UpdateDataSetPermissions
+      PhysicalTableMap:
+        ssm-inventory:
+          CustomSql:
+            DataSourceArn: !GetAtt SSMDataSyncSource.Arn
+            Name: ssm-inventory
+            Columns:
+              - Name: resourceId
+                Type: STRING
+              - Name: AgentVersion
+                Type: STRING
+              - Name: ComputerName
+                Type: STRING
+              - Name: IpAddress
+                Type: STRING
+              - Name: PlatformName
+                Type: STRING
+              - Name: PlatformType
+                Type: STRING
+              - Name: ResourceType
+                Type: STRING
+              - Name: InstanceStatus
+                Type: STRING
+              - Name: accountid
+                Type: STRING
+              - Name: region
+                Type: STRING
+              - Name: application_name
+                Type: STRING
+              - Name: application_publisher
+                Type: STRING
+              - Name: application_version
+                Type: STRING
+              - Name: application_installedTime
+                Type: STRING
+              - Name: application_release
+                Type: STRING
+              - Name: application_type
+                Type: STRING
+              - Name: application_architecture
+                Type: STRING
+              - Name: application_summary
+                Type: STRING
+              - Name: application_packageId
+                Type: STRING
+              - Name: application_url
+                Type: STRING
+              - Name: tag_key
+                Type: STRING
+              - Name: tag_value
+                Type: STRING
+              - Name: ec2type
+                Type: STRING
+              - Name: provider
+                Type: STRING
+              - Name: diskspacestatus
+                Type: STRING
+              - Name: freespacepercent
+                Type: STRING
+              - Name: totalgb
+                Type: STRING
+              - Name: instancetype
+                Type: STRING
+              - Name: nvmeversion
+                Type: STRING
+              - Name: freegb
+                Type: STRING
+              - Name: enaversion
+                Type: STRING
+              - Name: licensetype
+                Type: STRING
+              - Name: ComplianceType
+                Type: STRING
+              - Name: PatchBaselineId
+                Type: STRING
+              - Name: compliance_status
+                Type: STRING
+              - Name: PatchGroup
+                Type: STRING
+              - Name: ExecutionTime
+                Type: STRING
+              - Name: ExecutionId
+                Type: STRING
+              - Name: ExecutionType
+                Type: STRING
+              - Name: patch_installedtime
+                Type: STRING
+              - Name: patch_title
+                Type: STRING
+              - Name: patch_classification
+                Type: STRING
+              - Name: patch_id
+                Type: STRING
+              - Name: patch_status
+                Type: STRING
+              - Name: patch_documentname
+                Type: STRING
+            SqlQuery: !Sub |-
+              SELECT 
+                -- AWS:InstanceInformation fields
+                ii.resourceId,
+                ii.AgentVersion,
+                ii.ComputerName,
+                ii.IpAddress,
+                ii.PlatformName,
+                ii.PlatformType,
+                ii.ResourceType,
+                ii.InstanceStatus,
+                ii.accountid,
+                ii.region,
+    
+                -- AWS:Application fields
+                app.Name AS application_name,
+                app.Publisher AS application_publisher,
+                app.Version AS application_version,
+                app.InstalledTime AS application_installedTime,
+                app.Release AS application_release,
+                app.ApplicationType AS application_type,
+                app.Architecture AS application_architecture,
+                app.Summary AS application_summary,
+                app.PackageId AS application_packageId,
+                app.URL AS application_url,
+    
+                -- AWS:Tag fields
+                tag.Key AS tag_key,
+                tag.Value AS tag_value,
+    
+                -- Custom:NodeInfo fields
+                node.ec2type,
+                node.cloudprovider AS provider,
+                node.diskspacestatus,
+                node.freespacepercent,
+                node.totalgb,
+                node.instancetype,
+                node.nvmeversion,
+                node.freegb,
+                node.enaversion,
+                node.licensetype,
+
+                --AWS:ComplianceSummary fields
+                cs.ComplianceType,
+                cs.PatchBaselineId,
+                cs.Status AS compliance_status,
+                cs.PatchGroup,
+                cs.ExecutionTime,
+                cs.ExecutionId,
+                cs.ExecutionType,
+
+                --AWS:ComplianceItem fields
+                ci.InstalledTime AS patch_installedtime,
+                ci.Title AS patch_title,
+                ci.Classification AS patch_classification,
+                ci.Id AS patch_id,
+                ci.PatchState AS patch_status,
+                ci.DocumentName AS patch_documentname
+
+              FROM 
+                  "${AthenaDatabaseName}"."aws_instanceinformation" ii
+              LEFT JOIN 
+                  "${AthenaDatabaseName}"."aws_application" app ON ii.resourceId = app.resourceId
+              LEFT JOIN 
+                  "${AthenaDatabaseName}"."aws_tag" tag ON ii.resourceId = tag.resourceId
+              LEFT JOIN 
+                  "${AthenaDatabaseName}"."custom_nodeinfo" node ON ii.resourceId = node.resourceId
+              LEFT JOIN 
+                  "${AthenaDatabaseName}"."aws_compliancesummary" cs ON ii.resourceId = cs.resourceId
+              LEFT JOIN 
+                  "${AthenaDatabaseName}"."aws_complianceitem" ci ON ii.resourceId = ci.resourceId
+      LogicalTableMap:
+        MainTable:
+          Alias: "SSM Inventory"
+          Source:
+            PhysicalTableId: ssm-inventory
+          DataTransforms:
+            - FilterOperation:
+                ConditionExpression: 'NOT ({InstanceStatus}="Terminated")'
+  SSMInventoryAnalysis:
+    Type: AWS::QuickSight::Analysis
+    Properties:
+      AnalysisId: SSMInventoryAnalysis
+      AwsAccountId: !Ref AWS::AccountId
+      Name: SSM Inventory Analysis
+      Definition:
+        FilterGroups:
+          - FilterGroupId: "AccountFilter"
+            CrossDataset: "SINGLE_DATASET"
+            Status: "ENABLED"
+            ScopeConfiguration:
+              AllSheets: {}
+            Filters:
+              - CategoryFilter:
+                  FilterId: "AccountFilter"
+                  Column:
+                    DataSetIdentifier: "ssm-inventory"
+                    ColumnName: "accountid"
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: "CONTAINS"
+                      NullOption: "NON_NULLS_ONLY"
+                      SelectAllOptions: "FILTER_ALL_VALUES"
+                  DefaultFilterControlConfiguration:
+                    Title: "Account ID"
+                    ControlOptions:
+                      DefaultDropdownOptions:
+                        Type: "MULTI_SELECT"
+                        DisplayOptions:
+                          SelectAllOptions:
+                            Visibility: "VISIBLE"
+                          TitleOptions:
+                            Visibility: "VISIBLE"
+          - FilterGroupId: "RegionFilters"
+            CrossDataset: "SINGLE_DATASET"
+            Status: "ENABLED"
+            ScopeConfiguration:
+              AllSheets: {}
+            Filters:
+              - CategoryFilter:
+                  FilterId: "RegionFilter"
+                  Column:
+                    DataSetIdentifier: "ssm-inventory"
+                    ColumnName: "region"
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: "CONTAINS"
+                      NullOption: "NON_NULLS_ONLY"
+                      SelectAllOptions: "FILTER_ALL_VALUES"
+                  DefaultFilterControlConfiguration:
+                    Title: "Region"
+                    ControlOptions:
+                      DefaultDropdownOptions:
+                        Type: "MULTI_SELECT"
+                        DisplayOptions:
+                          SelectAllOptions:
+                            Visibility: "VISIBLE"
+                          TitleOptions:
+                            Visibility: "VISIBLE"
+          - FilterGroupId: "ProviderFilters"
+            CrossDataset: "SINGLE_DATASET"
+            Status: "ENABLED"
+            ScopeConfiguration:
+              AllSheets: {}
+            Filters:  
+              - CategoryFilter:
+                  FilterId: "ProviderFilter"
+                  Column:
+                    DataSetIdentifier: "ssm-inventory"
+                    ColumnName: "provider"
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: "CONTAINS"
+                      NullOption: "NON_NULLS_ONLY"
+                      SelectAllOptions: "FILTER_ALL_VALUES"
+                  DefaultFilterControlConfiguration:
+                    Title: "Provider"
+                    ControlOptions:
+                      DefaultDropdownOptions:
+                        Type: "MULTI_SELECT"
+                        DisplayOptions:
+                          SelectAllOptions:
+                            Visibility: "VISIBLE"
+                          TitleOptions:
+                            Visibility: "VISIBLE"
+        Sheets:
+          - SheetId: Operations
+            Name: Operations
+            FilterControls:
+              - CrossSheet:
+                  FilterControlId: "AccountControl"
+                  SourceFilterId: "AccountFilter"
+              - CrossSheet:
+                  FilterControlId: "RegionControl"
+                  SourceFilterId: "RegionFilter"
+              - CrossSheet:
+                  FilterControlId: "ProviderControl"
+                  SourceFilterId: "ProviderFilter"
+          - SheetId: Compliance
+            Name: Compliance
+            FilterControls:
+              - CrossSheet:
+                  FilterControlId: "AccountControl1"
+                  SourceFilterId: "AccountFilter"
+              - CrossSheet:
+                  FilterControlId: "RegionControl2"
+                  SourceFilterId: "RegionFilter"
+              - CrossSheet:
+                  FilterControlId: "ProviderControl3"
+                  SourceFilterId: "ProviderFilter"
+        DataSetIdentifierDeclarations:
+          - Identifier: ssm-inventory
+            DataSetArn: !GetAtt SSMInventoryDataSet.Arn
+      Permissions:
+        - Principal: !Sub
+            - arn:${AWS::Partition}:quicksight:${QuickSightRegion}:${AWS::AccountId}:user/default/${QuickSightUser}
+            - QuickSightRegion: !GetAtt InvokeCrawlerLambda.QuickSightRegion
+          Actions:
+          - quicksight:DeleteAnalysis
+          - quicksight:DescribeAnalysis
+          - quicksight:DescribeAnalysisPermissions
+          - quicksight:QueryAnalysis
+          - quicksight:RestoreAnalysis
+          - quicksight:UpdateAnalysis
+          - quicksight:UpdateAnalysisPermissions
+  S3CleanupLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LogAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketVersioning
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:DeleteBucket
+                Resource: !GetAtt S3Bucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource: !Join [ '', [ !GetAtt S3Bucket.Arn, '/*' ] ]
+  S3BucketCleanup:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "VPC is not required for this Lambda function execution. This function runs only once to empty the S3 bucket on CFN Delete request"
+    Properties:
+      Code:
+        ZipFile: |
+          #*
+          #* Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+          #* SPDX-License-Identifier: MIT-0
+          #*
+          #* Permission is hereby granted, free of charge, to any person obtaining a copy of this
+          #* software and associated documentation files (the "Software"), to deal in the Software
+          #* without restriction, including without limitation the rights to use, copy, modify,
+          #* merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+          #* permit persons to whom the Software is furnished to do so.
+          #*
+          #* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+          #* INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+          #* PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+          #* HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+          #* OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+          #* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+          #*
+
+          import cfnresponse
+          import boto3
+
+          def lambda_handler(event, context):
+              print(event)
+              responseData = {}
+              ResponseStatus = cfnresponse.SUCCESS
+              
+              try:
+                  s3BucketName = event['ResourceProperties']['S3BucketName']
+                  
+                  if event['RequestType'] == 'Delete':
+                      s3 = boto3.resource('s3')
+                      s3Client = boto3.client('s3')
+                      bucket = s3.Bucket(s3BucketName)
+                      
+                      # Delete all object versions and delete markers
+                      bucket.object_versions.delete()
+                      
+                      # Delete the bucket
+                      s3Client.delete_bucket(Bucket=s3BucketName)
+                      responseData['Message'] = "S3 bucket emptied and deleted successfully!"
+                  else:
+                      responseData['Message'] = f"No action needed for {event['RequestType']}"
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  ResponseStatus = cfnresponse.FAILED
+                  responseData['Error'] = str(e)
+              
+              cfnresponse.send(event, context, ResponseStatus, responseData)
+
+      Description: Empties and deletes S3 bucket on CloudFormation stack deletion.
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt S3CleanupLambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      ReservedConcurrentExecutions: 5
+  S3Cleanup:
+    Type: Custom::S3BucketCleanup
+    Properties:
+      ServiceToken: !GetAtt S3BucketCleanup.Arn
+      S3BucketName: !Ref S3Bucket
+
+Outputs:
+  S3BucketOutput:
+    Description: Amazon S3 Bucket for AWS Systems Manager resource data sync
+    Value: !Ref ResourceSyncS3Bucket
+    Export:
+      Name: ResourceSyncS3Bucket
+  SSMInventoryAnalysis:
+    Description: Amazon QuickSight Analysis for SSM Inventory
+    Value: !Ref SSMInventoryAnalysis
+    Export:
+      Name: SSMInventoryAnalysis
