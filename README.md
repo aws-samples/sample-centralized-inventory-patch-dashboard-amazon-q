@@ -58,20 +58,6 @@ The solution captures comprehensive metadata including:
 
 This enhanced monitoring system provides a complete view of your infrastructure, enabling better decision-making and compliance management across your organization.
 
-### SSM Custom Association Collects:
-
-- Cloud_provider information
-- Total_diskspace
-- Free_diskspace
-- Free_space_percent
-- Diskspace_status
-- EC2-specific information:
-  - EC2_type
-  - Instance_type
-  - NVMe_version
-  - ENA_version
-  - License_type
-
 ## Prerequisites
 
 - [Systems Manager Managed nodes](https://docs.aws.amazon.com/systems-manager/latest/userguide/managed_instances.html)
