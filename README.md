@@ -19,6 +19,8 @@ The solution provides comprehensive visibility into your infrastructure through 
 
 The solution integrates multiple AWS services to create a comprehensive monitoring and visualization system:
 
+![](Inventory_with_Q_architecture.jpg)
+
 ### Key Components and Workflow:
 
 1. **Data Collection:**
